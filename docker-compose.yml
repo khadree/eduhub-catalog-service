@@ -1,0 +1,68 @@
+version: '3.8'
+
+services:
+  catalog-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: catalog-service
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://catalog_user:catalog_password@postgres:5432/catalog_db
+      - REDIS_URL=redis://redis:6379/0
+      - JWT_SECRET_KEY=your-secret-key-change-in-production
+      - DEBUG=True
+      - ENVIRONMENT=development
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - catalog-network
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: catalog-postgres
+    environment:
+      - POSTGRES_USER=catalog_user
+      - POSTGRES_PASSWORD=catalog_password
+      - POSTGRES_DB=catalog_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U catalog_user -d catalog_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - catalog-network
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: catalog-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - catalog-network
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  redis-data:
+
+networks:
+  catalog-network:
+    driver: bridge
