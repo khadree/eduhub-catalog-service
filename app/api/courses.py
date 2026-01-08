@@ -2,14 +2,15 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, or_
+from sqlalchemy.orm import selectinload
 from typing import Optional
-from datetime import date
 
 from app.database import get_db
 from app.schemas.course import (
     CourseCreate,
     CourseUpdate,
     CourseResponse,
+    CourseCreateResponse,
     CourseListResponse,
 )
 from app.models.course import Course, CourseStatus
@@ -22,8 +23,11 @@ from app.config import settings
 router = APIRouter(prefix="/courses", tags=["Courses"])
 
 
-def serialize_course(course: Course) -> dict:
-    """Serialize course model to dict for response"""
+def serialize_course(course: Course, enrolled_count: Optional[int] = None) -> dict:
+    """
+    Safely serialize a Course instance for list/search/detail responses.
+    enrolled_count is passed explicitly to avoid lazy loading enrollments.
+    """
     return {
         "id": course.id,
         "title": course.title,
@@ -33,18 +37,18 @@ def serialize_course(course: Course) -> dict:
         "teacher_id": course.teacher_id,
         "max_students": course.max_students,
         "duration_weeks": course.duration_weeks,
-        "status": course.status.value,
+        "status": course.status.value if isinstance(course.status, CourseStatus) else course.status,
         "is_active": course.is_active,
-        "enrolled_count": course.enrolled_count,
+        "enrolled_count": enrolled_count if enrolled_count is not None else course.enrolled_count,
         "is_full": course.is_full,
         "created_at": course.created_at.isoformat(),
         "updated_at": course.updated_at.isoformat(),
-        "teacher_name": course.teacher.full_name if course.teacher else None,
-        "category_name": course.category.name if course.category else None,
+        "teacher_name": getattr(course.teacher, "full_name", None) if hasattr(course, "teacher") and course.teacher else None,
+        "category_name": getattr(course.category, "name", None) if hasattr(course, "category") and course.category else None,
     }
 
 
-@router.post("/", response_model=CourseResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/", response_model=CourseCreateResponse, status_code=status.HTTP_201_CREATED)
 async def create_course(
     course_data: CourseCreate,
     db: AsyncSession = Depends(get_db),
@@ -57,47 +61,43 @@ async def create_course(
             detail="Only admins and teachers can create courses",
         )
 
-    # Check if course code already exists
-    result = await db.execute(select(Course).where(Course.code == course_data.code))
-    if result.scalar_one_or_none():
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Course code already exists",
-        )
+    # Check code uniqueness
+    if await db.scalar(select(Course).where(Course.code == course_data.code)):
+        raise HTTPException(status_code=400, detail="Course code already exists")
 
-    # Verify teacher exists
-    result = await db.execute(
-        select(Teacher).where(Teacher.id == course_data.teacher_id)
-    )
-    teacher = result.scalar_one_or_none()
-    if not teacher:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Teacher not found"
-        )
+    # Validate foreign keys
+    if not await db.scalar(select(Teacher).where(Teacher.id == course_data.teacher_id)):
+        raise HTTPException(status_code=404, detail="Teacher not found")
+    if not await db.scalar(select(Category).where(Category.id == course_data.category_id)):
+        raise HTTPException(status_code=404, detail="Category not found")
 
-    # Verify category exists
-    result = await db.execute(
-        select(Category).where(Category.id == course_data.category_id)
-    )
-    category = result.scalar_one_or_none()
-    if not category:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Category not found"
-        )
-
-    # Create course
     course = Course(**course_data.model_dump())
     db.add(course)
     await db.commit()
     await db.refresh(course)
-
-    # Eagerly load relationships
     await db.refresh(course, ["teacher", "category"])
 
-    # Invalidate cache
     await cache.delete_pattern("courses:*")
 
-    return serialize_course(course)
+    # Manually construct safe response
+    return {
+        "id": course.id,
+        "title": course.title,
+        "description": course.description,
+        "code": course.code,
+        "category_id": course.category_id,
+        "teacher_id": course.teacher_id,
+        "max_students": course.max_students,
+        "duration_weeks": course.duration_weeks,
+        "status": course.status,
+        "is_active": course.is_active,
+        "created_at": course.created_at,
+        "updated_at": course.updated_at,
+        "teacher_name": course.teacher.full_name if course.teacher else None,
+        "category_name": course.category.name if course.category else None,
+        "enrolled_count": 0,
+        "is_full": False,
+    }
 
 
 @router.get("/", response_model=CourseListResponse)
@@ -111,18 +111,23 @@ async def list_courses(
     db: AsyncSession = Depends(get_db),
 ):
     """List all courses with pagination and filters"""
-    # Try to get from cache
     cache_key = get_cache_key(
         "courses", "list", page, page_size, status_filter, category_id, teacher_id, is_active
     )
-    cached_data = await cache.get(cache_key)
-    if cached_data:
+    if cached_data := await cache.get(cache_key):
         return cached_data
 
-    # Build query
-    query = select(Course).join(Teacher).join(Category)
+    query = (
+        select(Course)
+        .join(Teacher)
+        .join(Category)
+        .options(
+            selectinload(Course.teacher),
+            selectinload(Course.category),
+            selectinload(Course.enrollments),
+        )
+    )
 
-    # Apply filters
     if status_filter:
         query = query.where(Course.status == status_filter)
     if category_id:
@@ -132,20 +137,15 @@ async def list_courses(
     if is_active is not None:
         query = query.where(Course.is_active == is_active)
 
-    # Get total count
-    count_query = select(func.count()).select_from(query.subquery())
-    result = await db.execute(count_query)
-    total = result.scalar()
+    total = (await db.execute(select(func.count()).select_from(query.subquery()))).scalar_one()
 
-    # Apply pagination
     query = query.offset((page - 1) * page_size).limit(page_size)
+    courses = (await db.execute(query)).scalars().all()
 
-    # Execute query
-    result = await db.execute(query)
-    courses = result.scalars().all()
-
-    # Serialize courses
-    serialized_courses = [serialize_course(course) for course in courses]
+    serialized_courses = [
+        serialize_course(course, enrolled_count=course.enrolled_count)
+        for course in courses
+    ]
 
     response_data = {
         "courses": serialized_courses,
@@ -155,37 +155,34 @@ async def list_courses(
         "total_pages": (total + page_size - 1) // page_size,
     }
 
-    # Cache the result
-    await cache.set(cache_key, response_data)
-
+    await cache.set(cache_key, response_data, ttl=settings.cache_ttl)
     return response_data
 
 
 @router.get("/{course_id}", response_model=CourseResponse)
 async def get_course(course_id: int, db: AsyncSession = Depends(get_db)):
     """Get a specific course by ID"""
-    # Try to get from cache
     cache_key = get_cache_key("courses", "detail", course_id)
-    cached_data = await cache.get(cache_key)
-    if cached_data:
+    if cached_data := await cache.get(cache_key):
         return cached_data
 
-    # Get course from database
     result = await db.execute(
-        select(Course).where(Course.id == course_id).join(Teacher).join(Category)
+        select(Course)
+        .where(Course.id == course_id)
+        .options(
+            selectinload(Course.teacher),
+            selectinload(Course.category),
+            selectinload(Course.enrollments),
+        )
     )
     course = result.scalar_one_or_none()
 
     if not course:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Course not found"
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Course not found")
 
-    serialized_course = serialize_course(course)
+    serialized_course = serialize_course(course, enrolled_count=course.enrolled_count)
 
-    # Cache the result
-    await cache.set(cache_key, serialized_course)
-
+    await cache.set(cache_key, serialized_course, ttl=settings.cache_ttl)
     return serialized_course
 
 
@@ -203,39 +200,38 @@ async def update_course(
             detail="Only admins and teachers can update courses",
         )
 
-    # Get course
     result = await db.execute(
-        select(Course).where(Course.id == course_id).join(Teacher).join(Category)
+        select(Course)
+        .where(Course.id == course_id)
+        .options(
+            selectinload(Course.teacher),
+            selectinload(Course.category),
+            selectinload(Course.enrollments),
+        )
     )
     course = result.scalar_one_or_none()
 
     if not course:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Course not found"
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Course not found")
 
-    # Check if code is being updated and already exists
     if course_data.code and course_data.code != course.code:
-        result = await db.execute(
-            select(Course).where(Course.code == course_data.code)
-        )
-        if result.scalar_one_or_none():
+        if await db.scalar(select(Course).where(Course.code == course_data.code)):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Course code already exists",
             )
 
-    # Update fields
-    for field, value in course_data.model_dump(exclude_unset=True).items():
+    update_data = course_data.model_dump(exclude_unset=True)
+    for field, value in update_data.items():
         setattr(course, field, value)
 
     await db.commit()
     await db.refresh(course)
+    await db.refresh(course, ["teacher", "category"])
 
-    # Invalidate cache
     await cache.delete_pattern("courses:*")
 
-    return serialize_course(course)
+    return serialize_course(course, enrolled_count=course.enrolled_count)
 
 
 @router.delete("/{course_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -251,21 +247,16 @@ async def delete_course(
             detail="Only admins can delete courses",
         )
 
-    # Get course
     result = await db.execute(select(Course).where(Course.id == course_id))
     course = result.scalar_one_or_none()
 
     if not course:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Course not found"
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Course not found")
 
     await db.delete(course)
     await db.commit()
 
-    # Invalidate cache
     await cache.delete_pattern("courses:*")
-
     return None
 
 
@@ -277,17 +268,19 @@ async def search_courses(
     db: AsyncSession = Depends(get_db),
 ):
     """Search courses by title, code, or teacher name"""
-    # Try to get from cache
     cache_key = get_cache_key("courses", "search", q, page, page_size)
-    cached_data = await cache.get(cache_key)
-    if cached_data:
+    if cached_data := await cache.get(cache_key):
         return cached_data
 
-    # Build search query
     query = (
         select(Course)
         .join(Teacher)
         .join(Category)
+        .options(
+            selectinload(Course.teacher),
+            selectinload(Course.category),
+            selectinload(Course.enrollments),
+        )
         .where(
             or_(
                 Course.title.ilike(f"%{q}%"),
@@ -298,20 +291,15 @@ async def search_courses(
         )
     )
 
-    # Get total count
-    count_query = select(func.count()).select_from(query.subquery())
-    result = await db.execute(count_query)
-    total = result.scalar()
+    total = (await db.execute(select(func.count()).select_from(query.subquery()))).scalar_one()
 
-    # Apply pagination
     query = query.offset((page - 1) * page_size).limit(page_size)
+    courses = (await db.execute(query)).scalars().all()
 
-    # Execute query
-    result = await db.execute(query)
-    courses = result.scalars().all()
-
-    # Serialize courses
-    serialized_courses = [serialize_course(course) for course in courses]
+    serialized_courses = [
+        serialize_course(course, enrolled_count=course.enrolled_count)
+        for course in courses
+    ]
 
     response_data = {
         "courses": serialized_courses,
@@ -321,7 +309,5 @@ async def search_courses(
         "total_pages": (total + page_size - 1) // page_size,
     }
 
-    # Cache the result
-    await cache.set(cache_key, response_data)
-
+    await cache.set(cache_key, response_data, ttl=settings.cache_ttl)
     return response_data

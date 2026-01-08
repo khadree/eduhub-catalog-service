@@ -45,6 +45,7 @@ app.include_router(students.router, prefix="/api/v1")
 app.include_router(categories.router, prefix="/api/v1")
 
 
+
 @app.get("/", status_code=status.HTTP_200_OK)
 async def root():
     """Root endpoint"""

@@ -1,13 +1,10 @@
-"""Course schemas"""
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 from datetime import datetime
 from typing import Optional, List
 from app.models.course import CourseStatus
 
 
 class CourseBase(BaseModel):
-    """Base course schema"""
-
     title: str = Field(..., min_length=1, max_length=255)
     description: str = Field(..., min_length=1)
     code: str = Field(..., min_length=1, max_length=50)
@@ -18,14 +15,10 @@ class CourseBase(BaseModel):
 
 
 class CourseCreate(CourseBase):
-    """Schema for creating a course"""
-
     pass
 
 
 class CourseUpdate(BaseModel):
-    """Schema for updating a course"""
-
     title: Optional[str] = Field(None, min_length=1, max_length=255)
     description: Optional[str] = Field(None, min_length=1)
     code: Optional[str] = Field(None, min_length=1, max_length=50)
@@ -37,9 +30,31 @@ class CourseUpdate(BaseModel):
     is_active: Optional[bool] = None
 
 
-class CourseResponse(CourseBase):
-    """Schema for course response"""
+class CourseCreateResponse(BaseModel):
+    """Response specifically for newly created courses — no ORM properties accessed"""
+    id: int
+    title: str
+    description: str
+    code: str
+    category_id: int
+    teacher_id: int
+    max_students: int
+    duration_weeks: int
+    status: CourseStatus
+    is_active: bool
+    created_at: datetime
+    updated_at: datetime
+    teacher_name: Optional[str] = None
+    category_name: Optional[str] = None
 
+    # Always 0 and False for new courses
+    enrolled_count: int = 0
+    is_full: bool = False
+
+    model_config = ConfigDict(from_attributes=True)  # Still allowed — we manually populate safe fields
+
+
+class CourseResponse(CourseBase):
     id: int
     status: CourseStatus
     is_active: bool
@@ -50,13 +65,10 @@ class CourseResponse(CourseBase):
     teacher_name: Optional[str] = None
     category_name: Optional[str] = None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class CourseListResponse(BaseModel):
-    """Schema for course list response with pagination"""
-
     courses: List[CourseResponse]
     total: int
     page: int

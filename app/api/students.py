@@ -1,7 +1,9 @@
 """Student endpoints"""
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, func, or_
+from sqlalchemy.sql import Select
+from typing import List
 
 from app.database import get_db
 from app.schemas.student import StudentCreate, StudentUpdate, StudentResponse
@@ -62,3 +64,54 @@ async def get_student(
         )
 
     return student
+
+
+@router.get("/", response_model=List[StudentResponse]) 
+async def get_students(
+    db: AsyncSession = Depends(get_db),
+    page: int = Query(1, ge=1, description="Page number"),
+    limit: int = Query(20, ge=1, le=100, description="Items per page"),
+    search: str | None = Query(None, description="Search in name or email"),
+    specialization: str | None = Query(None, description="Filter by specialization"),
+):
+    """
+    Get list of all teachers with pagination and optional filters.
+    """
+    query: Select = select(Student)
+
+    if search:
+        search_term = f"%{search.lower()}%"
+        query = query.where(
+            or_(
+                func.lower(Student.first_name).like(search_term),
+                func.lower(Student.last_name).like(search_term),
+                func.lower(Student.email).like(search_term),
+            )
+        )
+   
+    count_query = select(func.count()).select_from(query.subquery())
+    total_result = await db.execute(count_query)
+    total = total_result.scalar_one()
+
+    offset = (page - 1) * limit
+    query = query.order_by(Student.id.desc()).offset(offset).limit(limit)
+
+    result = await db.execute(query)
+    teachers = result.scalars().all()
+
+
+    return teachers
+
+
+
+@router.get("/check-exists/{email}", response_model=bool)
+async def check_student_exists(
+    email: str,
+    db: AsyncSession = Depends(get_db)
+):
+    """Check if a student profile exists by email"""
+    result = await db.execute(
+        select(Student).where(func.lower(Student.email) == email.lower())
+    )
+    student = result.scalar_one_or_none()
+    return student is not None

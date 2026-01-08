@@ -21,9 +21,10 @@ class Settings(BaseSettings):
     db_pool_size: int = 20
     db_max_overflow: int = 10
 
-    # Redis
+    # Redis / Cache
     redis_url: str = "redis://localhost:6379/0"
-    cache_ttl: int = 300
+    cache_ttl: int = 300          # Existing: default 5 minutes
+    CACHE_EXPIRE: int = 300       # ← Added this to match your endpoint usage
 
     # JWT Authentication
     jwt_secret_key: str
@@ -40,6 +41,8 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
         case_sensitive = False
+        # Optional: allow both lower and upper case env vars
+        env_file_encoding = "utf-8"
 
 
 settings = Settings()
