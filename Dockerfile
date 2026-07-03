@@ -50,29 +50,6 @@
 # CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
 
 
-# Builder stage
-FROM python:3.11-slim AS builder
-
-WORKDIR /app
-
-RUN apt-get update && apt-get install -y \
-    gcc \
-    postgresql-client \
-    && rm -rf /var/lib/apt/lists/*
-
-COPY requirements.txt .
-
-# Install into an isolated venv so we control exactly what gets copied
-RUN python -m venv /opt/venv
-ENV PATH="/opt/venv/bin:$PATH"
-
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
-
-# Strip build tooling out of the venv — not needed at runtime,
-# and their vendored deps (wheel, jaraco.context) carry known CVEs
-RUN pip uninstall -y pip setuptools wheel
-
 # Production stage
 FROM python:3.11-slim AS release
 
@@ -80,9 +57,11 @@ WORKDIR /app
 
 RUN apt-get update && apt-get upgrade -y && apt-get install -y \
     postgresql-client \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    # Strip base image's own bundled pip/setuptools/wheel — not needed at runtime
+    && python -m pip uninstall -y pip setuptools wheel
 
-# Copy only the isolated venv — pip/setuptools/wheel already stripped
+# Copy only the isolated venv — pip/setuptools/wheel already stripped from builder too
 COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
